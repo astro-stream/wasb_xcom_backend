@@ -1,0 +1,9 @@
+apache-airflow-providers-databricks==3.1.0
+apache-airflow-providers-microsoft-azure==4.1.0
+apache-airflow-providers-sftp==4.1.0
+azure-storage-blob
+pandas
+pyarrow==10.0.1
+s3fs
+shapely
+geopy
