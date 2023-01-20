@@ -30,6 +30,7 @@ class WasbXComBackend(BaseXCom):
 
             # load parquet to blob store
             hook.load_file(
+                max_concurrency=8,
                 file_path=temp.name,
                 container_name=WasbXComBackend.CONTAINER_NAME,
                 blob_name=key,
@@ -53,6 +54,7 @@ class WasbXComBackend(BaseXCom):
             # create temp file to load the Xcom .parquet
             with NamedTemporaryFile(delete=True) as temp_file:
                 hook.get_file(
+                    max_concurrency=8,
                     file_path=temp_file.name,
                     container_name=WasbXComBackend.CONTAINER_NAME,
                     blob_name=key
@@ -60,3 +62,5 @@ class WasbXComBackend(BaseXCom):
                 # return pyArrow Table from blob store
                 result = pq.read_table(temp_file.name)
         return result
+
+
