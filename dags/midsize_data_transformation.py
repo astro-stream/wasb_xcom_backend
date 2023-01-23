@@ -1,60 +1,107 @@
-from typing import Any
-from airflow.models.xcom import BaseXCom
-from airflow.providers.microsoft.azure.hooks.wasb import WasbHook
+from airflow.decorators import task, dag
+from airflow.decorators import task
+from airflow.providers.sftp.hooks.sftp import SFTPHook
+from airflow.providers.sftp.operators.sftp import SFTPOperator
 from tempfile import NamedTemporaryFile
-import uuid
-import pyarrow as pa
+from datetime import datetime, timedelta 
+import pandas as pd
 import pyarrow.parquet as pq
-import os
+import s3fs
+from shapely.wkt import loads
+import geopy
 
 
-class WasbXComBackend(BaseXCom):
-    PREFIX = "xcom_blob://"
-    CONTAINER_NAME = "xcom-backend"
+dag_owner = 'grayson.stream'
 
-    @staticmethod
-    def serialize_value(value: Any):
-        if isinstance(value, pa.Table):
-            # # Create a named temporary file
-            with NamedTemporaryFile(mode="wb", delete=False) as temp:
-                # Write to the temporary file
-                pq.write_table(value, temp)
-                # Get the temporary file's name
-                print(f"The temporary file's name is: {temp.name}")
+geolocator = geopy.Nominatim(user_agent='myusername') #My OpenMap username
 
-                # The temporary file will be deleted when the `with` block is exited
+def get_location_meta(row):
+    polygon = loads(row)
+    # Get the center point of the polygon
+    lon, lat = polygon.centroid.x, polygon.centroid.y
+    
+    try:
+        location = geolocator.reverse((lat, lon))
+        loc = location.raw
+        return pd.Series({'state': loc['address'].get('state', 'None'), 
+                          'city': loc['address'].get('city', loc['address'].get('town', 'None')), 
+                          'county': loc['address'].get('county', 'None'), 
+                          'postal_code': loc['address'].get('postcode', 'None') })
+    
+    except (AttributeError, KeyError, ValueError):
+        print('error', lat, lon)
+        return None, None, None, None
 
-                hook = WasbHook(wasb_conn_id="wasb_docker")
-                key = f"data_{str(uuid.uuid4())}.snappy.parquet"
-                # filename = f"{key}.csv"
+default_args = {'owner': dag_owner,
+        'depends_on_past': False,
+        'retries': 2,
+        'retry_delay': timedelta(minutes=5)
+        }
 
-            hook.load_file(
-                max_concurrency=8,
-                file_path=temp.name,
-                container_name=WasbXComBackend.CONTAINER_NAME,
-                blob_name=key,
-                overwrite=True
-            )
-            os.unlink(temp.name)
-                
-            value = WasbXComBackend.PREFIX + key
-        return BaseXCom.serialize_value(value)
+@dag(dag_id='midsize_data_transformation',
+        default_args=default_args,
+        description='',
+        start_date=datetime(2023,1,4),
+        schedule_interval='0 14 * * *',
+        catchup=False,
+)
 
-    @staticmethod
-    def deserialize_value(result) -> Any:
-        result = BaseXCom.deserialize_value(result)
-        if isinstance(result, str) and result.startswith(WasbXComBackend.PREFIX):
+def pyarrow_pull():
 
-            hook = WasbHook(wasb_conn_id="wasb_docker")
-            key = result.replace(WasbXComBackend.PREFIX, "")
-            file_name = f"{key}.csv"
+	@task(queue='large-wq')
+	def load_parquet_source():
+		fs = s3fs.S3FileSystem(anon=True,use_ssl=True)
+		
+		bucket_uri =  's3://ookla-open-data/parquet/performance/type=mobile'
+		
+		# Open the Parquet file
+		pf = pq.ParquetDataset(bucket_uri, filesystem=fs)
+		table = pf.read(use_threads=True)
 
-            with NamedTemporaryFile() as temp_file:
-                hook.get_file(
-                    max_concurrency=8,
-                    file_path=temp_file.name,
-                    container_name=WasbXComBackend.CONTAINER_NAME,
-                    blob_name=key
-                )
-                result = pq.read_table(temp_file.name)
-        return result
+		return table
+
+	@task(queue='large-wq')
+	def transform_data(table):
+		df = table.to_pandas()
+		tests_filter = df['tests'] > 9
+
+		filtered_df = df[tests_filter]
+		filtered_df = filtered_df.nlargest(10, 'avg_d_kbps')
+
+		filtered_df[['state', 'city', 'county', 'postal_code']] = filtered_df.apply(lambda x: get_location_meta(x['tile']), axis=1)
+
+		filtered_df['avg_d_mbps'] = filtered_df['avg_d_kbps'].apply(lambda x: "{:.2f} MB".format(x/1024))
+		filtered_df['avg_u_mbps'] = filtered_df['avg_u_kbps'].apply(lambda x: "{:.2f} MB".format(x/1024))
+		filtered_df['avg_d_gbps'] = filtered_df['avg_d_kbps'].apply(lambda x: "{:.2f} GB".format(x/1000000))
+		filtered_df['avg_u_gbps'] = filtered_df['avg_u_kbps'].apply(lambda x: "{:.2f} GB".format(x/1000000))
+
+		preped_df = filtered_df.drop(columns=['quadkey', 'tile'])
+
+		return preped_df
+	
+	@task()
+	def load_preped_file(preped_df,**context):
+		with NamedTemporaryFile(mode="wb", delete=True) as temp:
+			# Get the temporary file's name
+			print(f"The temporary file's name is: {temp.name}")
+			preped_df.to_csv(temp.name, index=False)
+
+			# The temporary file will be deleted when the `with` block is exited
+			key_file = f"{context.get('ds_nodash')}_ookla_speed_test.csv"
+			remote_filepath = f"/home/fe_shepard/speed_tests/{key_file}"
+			SFTPHook_hook = SFTPHook(ssh_conn_id='sftp_docker')
+			SFTPOperator(
+				task_id='SFTPOperator_task',
+				sftp_hook=SFTPHook_hook,
+				local_filepath=temp.name,
+				remote_filepath=remote_filepath,
+				confirm=True,
+				create_intermediate_dirs=False,
+			).execute(context=context)
+		return 
+
+	source_data = load_parquet_source()
+	preped_table = transform_data(source_data)
+	load_preped_file(preped_table)
+
+pyarrow_pull = pyarrow_pull()
